@@ -101,10 +101,12 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
             lambda_exist      = LAMBDA_EXIST,
         )
 
+        t_back = time.time()
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
         optimizer.step()
+        t_end = time.time()
 
         total_loss += loss.item()
         state_sum  += info['state_loss']
@@ -114,8 +116,7 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
                          st=f"{info['state_loss']:.4f}",
                          ex=f"{info['exist_loss']:.4f}")
         if n_batches == 1:
-            t_end = time.time()
-            print(f"    [timing] fwd={t_loss-t_fwd:.3f}s  loss={t_end-t_loss:.3f}s  per-batch")
+            print(f"    [timing] fwd={t_loss-t_fwd:.3f}s  loss={t_back-t_loss:.3f}s  back={t_end-t_back:.3f}s  per-batch")
 
     n = max(n_batches, 1)
     return total_loss / n, state_sum / n, exist_sum / n
