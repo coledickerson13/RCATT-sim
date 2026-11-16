@@ -88,8 +88,9 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
 
         gt_states_norm = model.norm_states(states)
 
+        t_fwd = time.time()
         pred_states, pred_logits = model(detections, det_valid, contexts=None)
-
+        t_loss = time.time()
         loss, info = compute_loss(
             pred_states       = pred_states,
             pred_exist_logits = pred_logits,
@@ -112,6 +113,9 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
         pbar.set_postfix(loss=f"{loss.item():.4f}",
                          st=f"{info['state_loss']:.4f}",
                          ex=f"{info['exist_loss']:.4f}")
+        if n_batches == 1:
+            t_end = time.time()
+            print(f"    [timing] fwd={t_loss-t_fwd:.3f}s  loss={t_end-t_loss:.3f}s  per-batch")
 
     n = max(n_batches, 1)
     return total_loss / n, state_sum / n, exist_sum / n
