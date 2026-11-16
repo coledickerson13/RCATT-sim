@@ -66,8 +66,8 @@ def set_seed(seed: int = 0):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
+    torch.backends.cudnn.deterministic = False   # allow fast non-deterministic kernels
+    torch.backends.cudnn.benchmark     = True    # auto-tune for fixed input sizes
 
 
 # ── One epoch of training ────────────────────────────────────────────────────
@@ -88,9 +88,8 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
 
         gt_states_norm = model.norm_states(states)
 
-        t_fwd = time.time()
         pred_states, pred_logits = model(detections, det_valid, contexts=None)
-        t_loss = time.time()
+
         loss, info = compute_loss(
             pred_states       = pred_states,
             pred_exist_logits = pred_logits,
@@ -101,12 +100,10 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
             lambda_exist      = LAMBDA_EXIST,
         )
 
-        t_back = time.time()
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
         optimizer.step()
-        t_end = time.time()
 
         total_loss += loss.item()
         state_sum  += info['state_loss']
@@ -115,8 +112,6 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
         pbar.set_postfix(loss=f"{loss.item():.4f}",
                          st=f"{info['state_loss']:.4f}",
                          ex=f"{info['exist_loss']:.4f}")
-        if n_batches == 1:
-            print(f"    [timing] fwd={t_loss-t_fwd:.3f}s  loss={t_back-t_loss:.3f}s  back={t_end-t_back:.3f}s  per-batch")
 
     n = max(n_batches, 1)
     return total_loss / n, state_sum / n, exist_sum / n
@@ -217,8 +212,11 @@ def main(args):
         print(f"  Resumed from epoch {ckpt['epoch']}  (best_val={best_val:.4f})\n")
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
-    train_loader = make_dataloader(args.train, batch_size=BATCH_SIZE, shuffle=True,  num_workers=2)
-    val_loader   = make_dataloader(args.val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    print("  Loading datasets into RAM ...", end=" ", flush=True)
+    t_load = time.time()
+    train_loader = make_dataloader(args.train, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
+    val_loader   = make_dataloader(args.val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    print(f"done ({time.time()-t_load:.1f}s)")
     print(f"  Train seqs : {len(train_loader.dataset):,}  ({len(train_loader)} batches/epoch)")
     print(f"  Val seqs   : {len(val_loader.dataset):,}  ({len(val_loader)} batches/epoch)\n")
 
