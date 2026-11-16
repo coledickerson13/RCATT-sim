@@ -31,6 +31,7 @@ import time
 
 import torch
 import torch.optim as optim
+from tqdm.auto import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -71,19 +72,20 @@ def set_seed(seed: int = 0):
 
 # ── One epoch of training ────────────────────────────────────────────────────
 
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, optimizer, device, epoch: int = 0):
     model.train()
     total_loss = state_sum = exist_sum = n_batches = 0
 
-    for batch in loader:
-        detections  = batch['detections' ].to(device)
-        det_valid   = batch['det_valid'  ].to(device)
-        states      = batch['states'     ].to(device)
-        state_valid = batch['state_valid'].to(device)
-        visible     = batch['visible'    ].to(device)
-        state_ids   = batch['state_ids'  ].to(device)
+    pbar = tqdm(loader, desc=f"  Ep {epoch:>3d} train", leave=False,
+                unit="b", ncols=90, dynamic_ncols=False)
+    for batch in pbar:
+        detections  = batch['detections' ].to(device, non_blocking=True)
+        det_valid   = batch['det_valid'  ].to(device, non_blocking=True)
+        states      = batch['states'     ].to(device, non_blocking=True)
+        # state_valid, visible, state_ids stay on CPU — losses.py uses them on CPU anyway
+        target_mask = batch['state_valid'] & batch['visible']   # (B, T, N_MAX) CPU bool
+        state_ids   = batch['state_ids']                        # (B, T, N_MAX) CPU int32
 
-        target_mask    = state_valid & visible
         gt_states_norm = model.norm_states(states)
 
         pred_states, pred_logits = model(detections, det_valid, contexts=None)
@@ -107,6 +109,9 @@ def train_epoch(model, loader, optimizer, device):
         state_sum  += info['state_loss']
         exist_sum  += info['exist_loss']
         n_batches  += 1
+        pbar.set_postfix(loss=f"{loss.item():.4f}",
+                         st=f"{info['state_loss']:.4f}",
+                         ex=f"{info['exist_loss']:.4f}")
 
     n = max(n_batches, 1)
     return total_loss / n, state_sum / n, exist_sum / n
@@ -114,20 +119,20 @@ def train_epoch(model, loader, optimizer, device):
 
 # ── One epoch of validation ──────────────────────────────────────────────────
 
-def val_epoch(model, loader, device):
+def val_epoch(model, loader, device, epoch: int = 0):
     model.eval()
     total_loss = state_sum = exist_sum = n_batches = 0
 
+    pbar = tqdm(loader, desc=f"  Ep {epoch:>3d} val  ", leave=False,
+                unit="b", ncols=90, dynamic_ncols=False)
     with torch.no_grad():
-        for batch in loader:
-            detections  = batch['detections' ].to(device)
-            det_valid   = batch['det_valid'  ].to(device)
-            states      = batch['states'     ].to(device)
-            state_valid = batch['state_valid'].to(device)
-            visible     = batch['visible'    ].to(device)
-            state_ids   = batch['state_ids'  ].to(device)
+        for batch in pbar:
+            detections  = batch['detections' ].to(device, non_blocking=True)
+            det_valid   = batch['det_valid'  ].to(device, non_blocking=True)
+            states      = batch['states'     ].to(device, non_blocking=True)
+            target_mask = batch['state_valid'] & batch['visible']   # CPU bool
+            state_ids   = batch['state_ids']                        # CPU int32
 
-            target_mask    = state_valid & visible
             gt_states_norm = model.norm_states(states)
 
             pred_states, pred_logits = model(detections, det_valid, contexts=None)
@@ -146,6 +151,7 @@ def val_epoch(model, loader, device):
             state_sum  += info['state_loss']
             exist_sum  += info['exist_loss']
             n_batches  += 1
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     n = max(n_batches, 1)
     return total_loss / n, state_sum / n, exist_sum / n
@@ -230,8 +236,8 @@ def main(args):
     for epoch in range(start_epoch, MAX_EPOCHS + 1):
         t0 = time.time()
 
-        tr_loss, tr_st, tr_ex = train_epoch(model, train_loader, optimizer, device)
-        vl_loss, vl_st, vl_ex = val_epoch(model, val_loader, device)
+        tr_loss, tr_st, tr_ex = train_epoch(model, train_loader, optimizer, device, epoch)
+        vl_loss, vl_st, vl_ex = val_epoch(model, val_loader, device, epoch)
 
         scheduler.step(vl_loss)
         elapsed = time.time() - t0

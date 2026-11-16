@@ -124,12 +124,13 @@ class TrackDecoder(nn.Module):
         ):
             # Cross-attention: each track query attends to detection embeddings
             q_norm  = cn(q)
-            q_cross, _ = cross(q_norm, enc_out, enc_out, key_padding_mask=pad_mask)
+            q_cross, _ = cross(q_norm, enc_out, enc_out,
+                               key_padding_mask=pad_mask, need_weights=False)
             q = q + q_cross
 
             # Self-attention: track queries interact with each other
             q_norm  = sn(q)
-            q_self, _ = self_a(q_norm, q_norm, q_norm)
+            q_self, _ = self_a(q_norm, q_norm, q_norm, need_weights=False)
             q = q + q_self
 
             # Position-wise FFN
