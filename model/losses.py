@@ -19,6 +19,11 @@ Identity-consistent (state_ids provided):
   Release: a query is freed when its target's state_id no longer appears in
   state_ids[b,t] (target has left the scene; state_valid → False).
 
+Performance note:
+  All matching is performed on CPU tensors to avoid per-iteration CUDA syncs.
+  Matched indices are collected across the full batch, then a single vectorized
+  GPU gather computes the state L1 loss.
+
 Total loss:
   L = λ_state * mean_L1_per_dim + λ_exist * mean_BCE_per_query
 """
@@ -37,20 +42,6 @@ def compute_loss(
     lambda_state : float = 2.0,
     lambda_exist : float = 1.0,
 ):
-    """
-    Parameters
-    ----------
-    pred_states, pred_exist_logits : model outputs from AgnosticTransformer.forward()
-    gt_states_norm                 : model.norm_states(batch['states'])
-    target_mask                    : batch['state_valid'] & batch['visible']
-    state_ids                      : batch['state_ids']  (optional; activates id-consistent mode)
-    lambda_state, lambda_exist     : loss weights
-
-    Returns
-    -------
-    loss   : scalar Tensor (requires_grad=True)
-    info   : dict of diagnostic floats (detached)
-    """
     if state_ids is not None:
         return _compute_loss_id(
             pred_states, pred_exist_logits, gt_states_norm, target_mask,
@@ -61,39 +52,55 @@ def compute_loss(
     B, T, N_MAX = pred_exist_logits.shape
     device = pred_states.device
 
-    state_loss_sum = torch.zeros((), device=device)
-    exist_loss_sum = torch.zeros((), device=device)
-    n_matched      = 0
-    n_queries      = 0
+    # Pre-move to CPU for matching — eliminates per-iteration CUDA syncs
+    pred_cpu = pred_states.detach().cpu()   # (B, T, N_MAX, 6)
+    gt_cpu   = gt_states_norm.detach().cpu()
+
+    # Collect all matched pairs; build exist targets on CPU
+    matched_b, matched_t, matched_q, matched_g = [], [], [], []
+    exist_targets_cpu = torch.zeros(B, T, N_MAX)
 
     for b in range(B):
         for t in range(T):
-            gt_live = target_mask[b, t].nonzero(as_tuple=False).squeeze(1)  # (n_gt,)
-            n_gt    = gt_live.numel()
+            gt_live = target_mask[b, t].nonzero(as_tuple=False).squeeze(1).tolist()
+            n_gt = len(gt_live)
+            if n_gt == 0:
+                continue
 
-            pred_s = pred_states[b, t]        # (N_MAX, 6)
-            pred_l = pred_exist_logits[b, t]  # (N_MAX,)
+            pred_s_cpu = pred_cpu[b, t]           # (N_MAX, 6)
+            gt_s_cpu   = gt_cpu[b, t][gt_live]    # (n_gt, 6)
 
-            exist_tgt = torch.zeros(N_MAX, device=device)
+            cost = torch.cdist(
+                pred_s_cpu.unsqueeze(0), gt_s_cpu.unsqueeze(0), p=1
+            ).squeeze(0) / 6.0                    # (N_MAX, n_gt) — CPU, no sync
+            row_idx, col_idx = linear_sum_assignment(cost.numpy())
 
-            if n_gt > 0:
-                gt_s = gt_states_norm[b, t][gt_live]   # (n_gt, 6)
-                cost = torch.cdist(
-                    pred_s.unsqueeze(0), gt_s.unsqueeze(0), p=1,
-                ).squeeze(0) / 6.0   # (N_MAX, n_gt)
-                row_idx, col_idx = linear_sum_assignment(cost.detach().cpu().numpy())
-                matched_pred   = pred_s[row_idx]
-                matched_gt     = gt_s[col_idx]
-                state_loss_sum = state_loss_sum + F.l1_loss(
-                    matched_pred, matched_gt, reduction="sum"
-                )
-                n_matched += len(row_idx)
-                exist_tgt[row_idx] = 1.0
+            for r, c in zip(row_idx.tolist(), col_idx.tolist()):
+                matched_b.append(b)
+                matched_t.append(t)
+                matched_q.append(r)
+                matched_g.append(gt_live[c])
+                exist_targets_cpu[b, t, r] = 1.0
 
-            exist_loss_sum = exist_loss_sum + F.binary_cross_entropy_with_logits(
-                pred_l, exist_tgt, reduction="sum"
-            )
-            n_queries += N_MAX
+    n_matched = len(matched_b)
+    n_queries = B * T * N_MAX
+    exist_targets = exist_targets_cpu.to(device)
+
+    if n_matched > 0:
+        bi = torch.tensor(matched_b, dtype=torch.long)
+        ti = torch.tensor(matched_t, dtype=torch.long)
+        qi = torch.tensor(matched_q, dtype=torch.long)
+        gi = torch.tensor(matched_g, dtype=torch.long)
+        # Single vectorized GPU gather + L1
+        state_loss_sum = F.l1_loss(
+            pred_states[bi, ti, qi], gt_states_norm[bi, ti, gi], reduction='sum'
+        )
+    else:
+        state_loss_sum = torch.zeros((), device=device)
+
+    exist_loss_sum = F.binary_cross_entropy_with_logits(
+        pred_exist_logits, exist_targets, reduction='sum'
+    )
 
     state_loss = state_loss_sum / (n_matched * 6 + 1e-8)
     exist_loss = exist_loss_sum / (n_queries  + 1e-8)
@@ -119,28 +126,30 @@ def _compute_loss_id(
     lambda_state, lambda_exist,
 ):
     """
-    Identity-consistent variant.  See module docstring for algorithm details.
+    Identity-consistent variant — all matching on CPU, one GPU gather at end.
 
     Key invariant used here:
         state_ids[b, t, n] != -1  ⟺  slot n is state_valid (target alive)
     """
     B, T, N_MAX = pred_exist_logits.shape
     device  = pred_states.device
-    ids_cpu = state_ids.cpu()   # small tensor; CPU access is fast
+    ids_cpu = state_ids.cpu()
 
-    state_loss_sum = torch.zeros((), device=device)
-    exist_loss_sum = torch.zeros((), device=device)
-    n_matched      = 0
-    n_queries      = 0
+    # Pre-move to CPU for matching — eliminates per-iteration CUDA syncs
+    pred_cpu = pred_states.detach().cpu()     # (B, T, N_MAX, 6)
+    gt_cpu   = gt_states_norm.detach().cpu()  # (B, T, N_MAX, 6)
+    mask_cpu = target_mask.cpu()              # (B, T, N_MAX)
+
+    # Collect matched pairs across the whole batch
+    matched_b, matched_t, matched_q, matched_g = [], [], [], []
+    exist_targets_cpu = torch.zeros(B, T, N_MAX)   # built on CPU, moved once
 
     for b in range(B):
-        # Per-sequence persistent assignment maps
-        id_to_query: dict = {}  # state_id  → query_idx
-        query_to_id: dict = {}  # query_idx → state_id
+        id_to_query: dict = {}   # state_id  → query_idx
+        query_to_id: dict = {}   # query_idx → state_id
 
         for t in range(T):
             # ── Build alive-ID → gt-slot map ─────────────────────────────────
-            # state_ids[b,t,n] == -1  means slot is padded / target is gone
             alive_id_to_slot = {}
             for n in range(N_MAX):
                 sid = int(ids_cpu[b, t, n])
@@ -153,14 +162,13 @@ def _compute_loss_id(
                     del id_to_query[query_to_id[q]]
                     del query_to_id[q]
 
-            # ── Supervised GT slots this frame ───────────────────────────────
-            sup_slots = target_mask[b, t].nonzero(as_tuple=False).squeeze(1)
+            sup_slots = mask_cpu[b, t].nonzero(as_tuple=False).squeeze(1).tolist()
 
             # ── Phase 1: honour existing assignments ─────────────────────────
-            force_pairs  = []  # (query_idx, gt_slot)
-            new_gt_slots = []  # (state_id, gt_slot) for targets not yet registered
+            force_pairs  = []
+            new_gt_slots = []
 
-            for g_slot in sup_slots.tolist():
+            for g_slot in sup_slots:
                 g_id = int(ids_cpu[b, t, g_slot])
                 if g_id in id_to_query:
                     force_pairs.append((id_to_query[g_id], g_slot))
@@ -169,21 +177,18 @@ def _compute_loss_id(
 
             # ── Phase 2: Hungarian for new targets on free queries ────────────
             free_queries = [q for q in range(N_MAX) if q not in query_to_id]
-            new_pairs    = []  # (query_idx, gt_slot) freshly assigned
+            new_pairs    = []
 
             if new_gt_slots and free_queries:
                 new_slot_idxs = [gs for _, gs in new_gt_slots]
-                pred_free = pred_states[b, t][
-                    torch.tensor(free_queries, dtype=torch.long, device=device)
-                ]  # (n_free, 6)
-                gt_new = gt_states_norm[b, t][
-                    torch.tensor(new_slot_idxs, dtype=torch.long, device=device)
-                ]  # (n_new, 6)
+                # CPU tensors — no CUDA sync
+                pred_free_cpu = pred_cpu[b, t][free_queries]    # (n_free, 6)
+                gt_new_cpu    = gt_cpu[b, t][new_slot_idxs]     # (n_new, 6)
 
                 cost = torch.cdist(
-                    pred_free.unsqueeze(0), gt_new.unsqueeze(0), p=1,
-                ).squeeze(0) / 6.0  # (n_free, n_new)
-                row_idx, col_idx = linear_sum_assignment(cost.detach().cpu().numpy())
+                    pred_free_cpu.unsqueeze(0), gt_new_cpu.unsqueeze(0), p=1,
+                ).squeeze(0) / 6.0   # (n_free, n_new) — CPU
+                row_idx, col_idx = linear_sum_assignment(cost.numpy())
 
                 for r, c in zip(row_idx.tolist(), col_idx.tolist()):
                     q              = free_queries[r]
@@ -192,27 +197,34 @@ def _compute_loss_id(
                     id_to_query[g_id] = q
                     query_to_id[q]    = g_id
 
-            # ── Compute losses on all matched pairs ───────────────────────────
-            all_pairs = force_pairs + new_pairs
-            exist_tgt = torch.zeros(N_MAX, device=device)
+            # ── Record all matched pairs ──────────────────────────────────────
+            for q, g in (force_pairs + new_pairs):
+                matched_b.append(b)
+                matched_t.append(t)
+                matched_q.append(q)
+                matched_g.append(g)
+                exist_targets_cpu[b, t, q] = 1.0   # CPU scalar write — no sync
 
-            if all_pairs:
-                q_idxs = torch.tensor([q for q, _ in all_pairs],
-                                      dtype=torch.long, device=device)
-                g_idxs = torch.tensor([g for _, g in all_pairs],
-                                      dtype=torch.long, device=device)
-                matched_pred   = pred_states[b, t][q_idxs]       # (n_match, 6)
-                matched_gt     = gt_states_norm[b, t][g_idxs]    # (n_match, 6)
-                state_loss_sum = state_loss_sum + F.l1_loss(
-                    matched_pred, matched_gt, reduction="sum"
-                )
-                n_matched += len(all_pairs)
-                exist_tgt[q_idxs] = 1.0
+    # ── Single vectorized GPU loss computation ────────────────────────────────
+    n_matched = len(matched_b)
+    n_queries = B * T * N_MAX
+    exist_targets = exist_targets_cpu.to(device)   # one H2D transfer
 
-            exist_loss_sum = exist_loss_sum + F.binary_cross_entropy_with_logits(
-                pred_exist_logits[b, t], exist_tgt, reduction="sum"
-            )
-            n_queries += N_MAX
+    if n_matched > 0:
+        bi = torch.tensor(matched_b, dtype=torch.long)
+        ti = torch.tensor(matched_t, dtype=torch.long)
+        qi = torch.tensor(matched_q, dtype=torch.long)
+        gi = torch.tensor(matched_g, dtype=torch.long)
+        # One GPU gather + one L1 call for the entire batch
+        state_loss_sum = F.l1_loss(
+            pred_states[bi, ti, qi], gt_states_norm[bi, ti, gi], reduction='sum'
+        )
+    else:
+        state_loss_sum = torch.zeros((), device=device)
+
+    exist_loss_sum = F.binary_cross_entropy_with_logits(
+        pred_exist_logits, exist_targets, reduction='sum'
+    )
 
     state_loss = state_loss_sum / (n_matched * 6 + 1e-8)
     exist_loss = exist_loss_sum / (n_queries  + 1e-8)
