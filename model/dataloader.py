@@ -40,8 +40,8 @@ from torch.utils.data import Dataset, DataLoader
 
 class RCATTDataset(Dataset):
     """
-    Lazy-loading HDF5 dataset.  Each HDF5 file is opened once per worker in
-    __getitem__ (lazy open pattern avoids h5py multiprocessing issues).
+    In-memory HDF5 dataset.  All arrays are read into RAM at construction
+    so that __getitem__ is a pure numpy index (no I/O, no HDF5 locking).
 
     Parameters
     ----------
@@ -50,41 +50,25 @@ class RCATTDataset(Dataset):
 
     def __init__(self, h5_path: str):
         self.h5_path = h5_path
-        self._file   = None   # opened lazily in __getitem__
-
-        # Read length from file without keeping it open
         with h5py.File(h5_path, 'r') as f:
-            self._len = f['states'].shape[0]
+            self._len  = f['states'].shape[0]
+            self._data = {
+                'detections' : f['detections' ][:].astype(np.float32),
+                'det_valid'  : f['det_valid'  ][:].astype(bool),
+                'states'     : f['states'     ][:].astype(np.float32),
+                'state_valid': f['state_valid'][:].astype(bool),
+                'visible'    : f['visible'    ][:].astype(bool),
+                'contexts'   : f['contexts'   ][:].astype(np.float32),
+                'state_ids'  : f['state_ids'  ][:].astype(np.int32),
+                'cfg_keys'   : f['cfg_keys'   ][:].astype(np.int64),
+                'sic_dbs'    : f['sic_dbs'    ][:].astype(np.float32),
+            }
 
     def __len__(self) -> int:
         return self._len
 
-    def _get_file(self) -> h5py.File:
-        """Open the HDF5 file for this worker (once per worker process)."""
-        if self._file is None:
-            self._file = h5py.File(self.h5_path, 'r', swmr=True)
-        return self._file
-
     def __getitem__(self, idx: int) -> dict:
-        f = self._get_file()
-        return {
-            'detections'  : torch.from_numpy(f['detections' ][idx].astype(np.float32)),
-            'det_valid'   : torch.from_numpy(f['det_valid'  ][idx].astype(bool)),
-            'states'      : torch.from_numpy(f['states'     ][idx].astype(np.float32)),
-            'state_valid' : torch.from_numpy(f['state_valid'][idx].astype(bool)),
-            'visible'     : torch.from_numpy(f['visible'    ][idx].astype(bool)),
-            'contexts'    : torch.from_numpy(f['contexts'   ][idx].astype(np.float32)),
-            'state_ids'   : torch.from_numpy(f['state_ids'  ][idx].astype(np.int32)),
-            'cfg_keys'    : torch.from_numpy(f['cfg_keys'   ][idx].astype(np.int64)),
-            'sic_dbs'     : torch.from_numpy(f['sic_dbs'    ][idx].astype(np.float32)),
-        }
-
-    def __del__(self):
-        if self._file is not None:
-            try:
-                self._file.close()
-            except Exception:
-                pass
+        return {k: torch.from_numpy(v[idx]) for k, v in self._data.items()}
 
 
 def make_dataloader(
@@ -102,8 +86,10 @@ def make_dataloader(
     h5_path     : path to .h5 file produced by generate_dataset.py
     batch_size  : sequences per batch
     shuffle     : True for train; False for val/test
-    num_workers : number of background loading workers; 0 = main process only
-                  (use 0 when debugging or on systems where fork is unreliable)
+    num_workers : background loading workers; default 0 (main process only).
+                  Since the entire dataset is held in RAM, num_workers=0 is
+                  fastest on Colab/Jupyter — fork overhead dominates any
+                  pipeline benefit when __getitem__ is a pure numpy index.
     pin_memory  : pin host memory for faster GPU transfers
 
     Returns
