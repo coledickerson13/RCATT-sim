@@ -72,7 +72,7 @@ def set_seed(seed: int = 0):
 
 # ── One epoch of training ────────────────────────────────────────────────────
 
-def train_epoch(model, loader, optimizer, device, epoch: int = 0):
+def train_epoch(model, loader, optimizer, scaler, device, epoch: int = 0):
     model.train()
     total_loss = state_sum = exist_sum = n_batches = 0
 
@@ -88,11 +88,14 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
 
         gt_states_norm = model.norm_states(states)
 
-        pred_states, pred_logits = model(detections, det_valid, contexts=None)
+        # Forward in fp16 via autocast
+        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+            pred_states, pred_logits = model(detections, det_valid, contexts=None)
 
+        # Loss outside autocast — torch.cdist in Hungarian doesn't support fp16
         loss, info = compute_loss(
-            pred_states       = pred_states,
-            pred_exist_logits = pred_logits,
+            pred_states       = pred_states.float(),
+            pred_exist_logits = pred_logits.float(),
             gt_states_norm    = gt_states_norm,
             target_mask       = target_mask,
             state_ids         = state_ids,
@@ -101,9 +104,11 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
         )
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         state_sum  += info['state_loss']
@@ -119,7 +124,7 @@ def train_epoch(model, loader, optimizer, device, epoch: int = 0):
 
 # ── One epoch of validation ──────────────────────────────────────────────────
 
-def val_epoch(model, loader, device, epoch: int = 0):
+def val_epoch(model, loader, scaler, device, epoch: int = 0):
     model.eval()
     total_loss = state_sum = exist_sum = n_batches = 0
 
@@ -135,11 +140,12 @@ def val_epoch(model, loader, device, epoch: int = 0):
 
             gt_states_norm = model.norm_states(states)
 
-            pred_states, pred_logits = model(detections, det_valid, contexts=None)
+            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                pred_states, pred_logits = model(detections, det_valid, contexts=None)
 
             loss, info = compute_loss(
-                pred_states       = pred_states,
-                pred_exist_logits = pred_logits,
+                pred_states       = pred_states.float(),
+                pred_exist_logits = pred_logits.float(),
                 gt_states_norm    = gt_states_norm,
                 target_mask       = target_mask,
                 state_ids         = state_ids,
@@ -195,6 +201,8 @@ def main(args):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-5,
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    print(f"  AMP       : {scaler.is_enabled()}")
 
     start_epoch = 1
     best_val    = float("inf")
@@ -206,6 +214,8 @@ def main(args):
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
+        if 'scaler' in ckpt:
+            scaler.load_state_dict(ckpt['scaler'])
         start_epoch = ckpt['epoch'] + 1
         best_val    = ckpt.get('best_val', float("inf"))
         es_count    = ckpt.get('es_count', 0)
@@ -239,8 +249,8 @@ def main(args):
     for epoch in range(start_epoch, MAX_EPOCHS + 1):
         t0 = time.time()
 
-        tr_loss, tr_st, tr_ex = train_epoch(model, train_loader, optimizer, device, epoch)
-        vl_loss, vl_st, vl_ex = val_epoch(model, val_loader, device, epoch)
+        tr_loss, tr_st, tr_ex = train_epoch(model, train_loader, optimizer, scaler, device, epoch)
+        vl_loss, vl_st, vl_ex = val_epoch(model, val_loader, scaler, device, epoch)
 
         scheduler.step(vl_loss)
         elapsed = time.time() - t0
@@ -263,6 +273,7 @@ def main(args):
                 "epoch": epoch, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
                 "best_val": best_val, "es_count": es_count,
             }, os.path.join(args.out, "last_model.pt"))
 
